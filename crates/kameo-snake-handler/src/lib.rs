@@ -1,15 +1,12 @@
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
-use std::panic::AssertUnwindSafe;
 use std::thread;
 use std::process;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use either::Either;
-use futures::FutureExt;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
@@ -26,7 +23,6 @@ use pyo3::pymethods;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, info, instrument, Level};
-use once_cell::sync::OnceCell;
 use pyo3::BoundObject;
 use pyo3::IntoPyObjectExt;
 
@@ -238,7 +234,13 @@ impl<M> Default for PythonActor<M> {
         let config = match std::env::var("KAMEO_PYTHON_CONFIG") {
             Ok(config_json) => {
                 info!(config_json, "Found KAMEO_PYTHON_CONFIG");
-                serde_json::from_str(&config_json).expect("Failed to deserialize python config from env")
+                match serde_json::from_str(&config_json) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        // This is a fatal error: process cannot continue without config
+                        panic!("Failed to deserialize python config from env: {e}");
+                    }
+                }
             }
             Err(e) => {
                 error!(error = ?e, "KAMEO_PYTHON_CONFIG not set");
@@ -251,10 +253,15 @@ impl<M> Default for PythonActor<M> {
         static CHILD_RUNTIME_INIT: std::sync::Once = std::sync::Once::new();
         CHILD_RUNTIME_INIT.call_once(|| {
             let runtime = Box::leak(Box::new(
-                tokio::runtime::Builder::new_current_thread()
+                match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build()
-                    .expect("Failed to build single-threaded Tokio runtime"),
+                    .build() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            // This is a fatal error: process cannot continue without a runtime
+                            panic!("Failed to build single-threaded Tokio runtime: {e}");
+                        }
+                    }
             ));
             // Only call if not already initialized, ignore error if already set
             let _ = pyo3_async_runtimes::tokio::init_with_runtime(runtime);
@@ -389,7 +396,7 @@ where
         _actor_ref: ActorRef<Self>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            tracing::info!("PythonActor started");
+            tracing::info!(event = "lifecycle", status = "started", actor_type = "PythonActor");
             Ok(())
         }
     }
@@ -401,7 +408,7 @@ where
         reason: ActorStopReason,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            error!("Python actor stopped: {:?}", reason);
+            tracing::error!(event = "lifecycle", status = "stopped", actor_type = "PythonActor", reason = ?reason);
             Ok(())
         }
     }
@@ -414,7 +421,7 @@ where
     ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
     {
         async move {
-            error!("Python actor panicked: {:?}", err);
+            tracing::error!(event = "lifecycle", status = "panicked", actor_type = "PythonActor", error = ?err);
             Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
         }
     }
@@ -424,7 +431,10 @@ impl<M> PythonActor<M>
 where
     M: KameoChildProcessMessage + Send + 'static,
 {
+    #[allow(dead_code)]
     /// Convert a Rust message to a Python dictionary
+    ///
+    /// This method is currently unused, but is kept for future extension or trait completeness.
     fn serialize_message_to_py(&self, message: &M, py: Python) -> Result<PyObject, PythonExecutionError> {
         to_pyobject(py, message)
             .map_err(|e| PythonExecutionError::SerializationError {
@@ -432,7 +442,10 @@ where
             })
     }
 
+    #[allow(dead_code)]
     /// Convert a Python object back to our Reply type
+    ///
+    /// This method is currently unused, but is kept for future extension or trait completeness.
     fn deserialize_py_to_reply(&self, py_obj: &Bound<PyAny>) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError> {
         from_pyobject(py_obj)
             .map_err(|e| PythonExecutionError::DeserializationError {
@@ -455,18 +468,14 @@ where
     fn handle(&mut self, message: M, _ctx: &mut Context<Self, Self::Reply>) -> impl std::future::Future<Output = Self::Reply> + Send {
         let config = self.config.clone();
         async move {
-            tracing::info!(
-                "[ORKIMEDES] Entering async handler: pid={}, tid={:?}",
-                process::id(),
-                thread::current().id()
-            );
+            tracing::info!(event = "handler", step = "enter", pid = process::id(), tid = ?thread::current().id());
             if config.is_async {
                 // Step 1: Create the future inside the GIL.
                 let future = Python::with_gil(|py| {
                     let asyncio = py.import("asyncio").map_err(|e| PythonExecutionError::ImportError { module: "asyncio".to_string(), message: e.to_string() })?;
                     let event_loop = asyncio.call_method0("get_event_loop").map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
                     let event_loop_id = event_loop.getattr("_thread_id").ok().and_then(|id| id.extract::<u64>().ok());
-                    tracing::info!("[ORKIMEDES] Creating coroutine: pid={}, tid={:?}, event_loop_id={:?}", process::id(), thread::current().id(), event_loop_id);
+                    tracing::info!(event = "coroutine", step = "create", pid = process::id(), tid = ?thread::current().id(), event_loop_id = ?event_loop_id);
                     let message_json = serde_json::to_value(&message)
                         .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
                     let message_str = serde_json::to_string(&message_json)
@@ -483,17 +492,17 @@ where
                     pyo3_async_runtimes::tokio::into_future(py_coro)
                         .map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })
                 })?;
-                tracing::info!("[ORKIMEDES] Awaiting coroutine: pid={}, tid={:?}", process::id(), thread::current().id());
+                tracing::info!(event = "coroutine", status = "awaiting", pid = process::id(), tid = ?thread::current().id());
                 // Step 2: Await the future outside the GIL.
                 let py_result = future.await
                     .map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
-                tracing::info!("[ORKIMEDES] Coroutine complete: pid={}, tid={:?}", process::id(), thread::current().id());
+                tracing::info!(event = "coroutine", status = "complete", pid = process::id(), tid = ?thread::current().id());
                 // Step 3: Process the result inside the GIL.
                 Python::with_gil(|py| {
                     let asyncio = py.import("asyncio").map_err(|e| PythonExecutionError::ImportError { module: "asyncio".to_string(), message: e.to_string() })?;
                     let event_loop = asyncio.call_method0("get_event_loop").map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
                     let event_loop_id = event_loop.getattr("_thread_id").ok().and_then(|id| id.extract::<u64>().ok());
-                    tracing::info!("[ORKIMEDES] Processing result in GIL: pid={}, tid={:?}, event_loop_id={:?}", process::id(), thread::current().id(), event_loop_id);
+                    tracing::info!(event = "coroutine", step = "process_result", pid = process::id(), tid = ?thread::current().id(), event_loop_id = ?event_loop_id);
                     let json = py.import("json").map_err(|e| PythonExecutionError::ImportError { module: "json".to_string(), message: e.to_string() })?;
                     let json_str = json.call_method1("dumps", (py_result.bind(py),))
                         .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?
@@ -502,7 +511,7 @@ where
                     serde_json::from_str(&json_str)
                         .map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })
                 })
-            } else {
+                    } else {
                 // Handle synchronous Python function
                 pyo3::Python::with_gil(|py| {
                     let message_json = serde_json::to_value(&message)
@@ -541,52 +550,51 @@ where
         let config = self.config.clone();
         let callback_handle = self.callback_handle.clone();
 
-        // --- MACRO PATTERN START ---
-        // 1. Prepare Python for multi-threaded use
-        tracing::info!("[Orkimedes] prepare_freethreaded_python()");
-        pyo3::prepare_freethreaded_python();
+            // --- MACRO PATTERN START ---
+            // 1. Prepare Python for multi-threaded use
+            tracing::info!(event = "runtime_init", step = "prepare_freethreaded_python");
+            pyo3::prepare_freethreaded_python();
         // (No explicit event loop setup needed)
 
         // 2. Store the runtime in the global static
         let _ = CHILD_RUNTIME.set(runtime);
-        tracing::info!("[Orkimedes] Stored Tokio runtime in CHILD_RUNTIME static");
+        tracing::info!(event = "runtime_init", step = "store_runtime");
 
         // 3. Bridge is already initialized in static child process init, do not call again
-        tracing::info!("[Orkimedes] Python async bridge already initialized in child process");
-        // --- MACRO PATTERN END ---
+        tracing::info!(event = "runtime_init", step = "bridge_already_initialized");
+            // --- MACRO PATTERN END ---
 
         // Synchronously try to import module/function
-        let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
-            let sys = py.import("sys")?;
-            let path = sys.getattr("path")?;
-            for p in &config.python_path {
-                path.call_method1("append", (p,))?;
-            }
-
-            if let Some(handle) = callback_handle.clone() {
-                let kameo_module = PyModule::new(py, "kameo")?;
-                let py_callback_handle = KameoCallbackHandle { handle };
-                let handle_obj = Py::new(py, py_callback_handle)?;
-                kameo_module.add("callback_handle", handle_obj)?;
-                sys.getattr("modules")?.set_item("kameo", kameo_module)?;
-            }
-
-            let module = py.import(&config.module_name)?;
-            let function = module.getattr(&config.function_name).map_err(|e| {
-                PythonExecutionError::FunctionNotFound {
-                    module: config.module_name.clone(),
-                    function: config.function_name.clone(),
-                    message: e.to_string(),
+            let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
+                let sys = py.import("sys")?;
+                let path = sys.getattr("path")?;
+                for p in &config.python_path {
+                    path.call_method1("append", (p,))?;
                 }
-            })?;
 
-            Ok(function.into())
-        });
+                if let Some(handle) = callback_handle.clone() {
+                    let kameo_module = PyModule::new(py, "kameo")?;
+                    let py_callback_handle = KameoCallbackHandle { handle };
+                    let handle_obj = Py::new(py, py_callback_handle)?;
+                    kameo_module.add("callback_handle", handle_obj)?;
+                    sys.getattr("modules")?.set_item("kameo", kameo_module)?;
+                }
+
+                let module = py.import(&config.module_name)?;
+                let function = module.getattr(&config.function_name).map_err(|e| {
+                    PythonExecutionError::FunctionNotFound {
+                        module: config.module_name.clone(),
+                        function: config.function_name.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+
+                Ok(function.into())
+            });
 
         // Synchronous fatal error check
         if let Err(e) = &module_result {
-            error!("Failed to initialize Python function: {:?}", e);
-            tracing::error!(error = ?e, "Non-resumable error: shutting down child process");
+            tracing::error!(event = "runtime_init", error = ?e, status = "fatal", message = "Failed to initialize Python function, shutting down child process");
             std::process::exit(101);
         }
 
@@ -594,7 +602,7 @@ where
             match module_result {
                 Ok(py_function) => {
                     self.py_function = Some(py_function);
-                    tracing::info!("Python runtime initialization complete");
+                    tracing::info!(event = "runtime_init", status = "complete");
                     Ok(())
                 }
                 Err(_) => unreachable!(), // Already handled above

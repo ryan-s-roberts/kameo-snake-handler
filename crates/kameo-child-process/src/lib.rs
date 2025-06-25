@@ -29,6 +29,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 use once_cell::sync::OnceCell;
 use pyo3;
+use tokio::time::{Duration, sleep};
 
 pub use callback::{CallbackHandle, ChildCallbackMessage, CallbackSender, CallbackReceiver, CallbackHandler};
 
@@ -155,7 +156,7 @@ pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessActorError {
         event = "lifecycle",
         status = "error",
         actor_type = actor_name,
-        "Unknown actor type encountered"
+        message = "Unknown actor type encountered"
     );
     SubprocessActorError::UnknownActorType {
         actor_name: actor_name.to_string(),
@@ -186,7 +187,7 @@ where
         debug!(
             event = "lifecycle",
             status = "starting",
-            "Starting subprocess actor"
+            actor_type = "SubprocessActor"
         );
 
         async move {
@@ -216,7 +217,7 @@ where
             debug!(
                 event = "lifecycle",
                 status = "started",
-                "Subprocess actor started successfully"
+                actor_type = "SubprocessActor"
             );
             Ok(())
         }
@@ -231,8 +232,8 @@ where
         debug!(
             event = "lifecycle",
             status = "stopping",
-            ?reason,
-            "Stopping subprocess actor"
+            actor_type = "SubprocessActor",
+            reason = ?reason
         );
 
         async move {
@@ -251,7 +252,7 @@ where
             debug!(
                 event = "lifecycle",
                 status = "stopped",
-                "Subprocess actor stopped"
+                actor_type = "SubprocessActor"
             );
             Ok(())
         }
@@ -264,7 +265,7 @@ where
         err: PanicError,
     ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
     {
-        error!(event = "lifecycle", status = "panicked", error = ?err, "Subprocess actor panicked");
+        error!(event = "lifecycle", status = "panicked", actor_type = "SubprocessActor", error = ?err);
         async move { Ok(ControlFlow::Break(ActorStopReason::Panicked(err))) }
     }
 }
@@ -313,7 +314,7 @@ pub mod handshake {
         let socket_path = unique_socket_path(actor_name);
         let socket_path_str = socket_path.to_string_lossy().into_owned();
 
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path_str, "Starting host handshake");
+        debug!(event = "handshake", status = "starting", socket_path = %socket_path_str, actor_type = actor_name);
 
         let mut cmd = Command::new(exe);
         cmd.env("KAMEO_CHILD_ACTOR", actor_name);
@@ -328,24 +329,24 @@ pub mod handshake {
         debug!(
             event = "handshake",
             status = "spawning",
-            "Spawning child process"
+            actor_type = actor_name
         );
         let child = cmd.spawn()?;
 
         debug!(
             event = "handshake",
             status = "waiting",
-            "Waiting for child connection"
+            actor_type = actor_name
         );
         let conn = incoming.next().await.transpose()?.ok_or_else(|| {
-            error!(event = "handshake", "No child connection received");
+            error!(event = "handshake", actor_type = actor_name, "No child connection received");
             io::Error::new(io::ErrorKind::Other, "No child connection")
         })?;
 
         debug!(
             event = "handshake",
             status = "completed",
-            "Host handshake completed successfully"
+            actor_type = actor_name
         );
         Ok((Box::new(conn), child, socket_path))
     }
@@ -355,14 +356,14 @@ pub mod handshake {
         let socket_path = std::env::var("KAMEO_REQUEST_SOCKET")
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_REQUEST_SOCKET not set"))?;
 
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child request handshake");
+        debug!(event = "handshake", status = "starting", socket_path = %socket_path, actor_type = "child");
 
         let conn = tokio::net::UnixStream::connect(&socket_path).await?;
 
         debug!(
             event = "handshake",
             status = "completed",
-            "Child request handshake completed successfully"
+            actor_type = "child"
         );
         Ok(Box::new(conn))
     }
@@ -372,14 +373,14 @@ pub mod handshake {
         let socket_path = std::env::var("KAMEO_CALLBACK_SOCKET")
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_CALLBACK_SOCKET not set"))?;
 
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child callback handshake");
+        debug!(event = "handshake", status = "starting", socket_path = %socket_path, actor_type = "child");
 
         let conn = tokio::net::UnixStream::connect(&socket_path).await?;
 
         debug!(
             event = "handshake",
             status = "completed",
-            "Child callback handshake completed successfully"
+            actor_type = "child"
         );
         Ok(Box::new(conn))
     }
@@ -537,7 +538,6 @@ where
         );
 
         // Wait for child to connect to both sockets, with timeout and liveness check
-        use tokio::time::{timeout, Duration, sleep};
         let timeout_duration = Duration::from_secs(3);
         let poll_interval = Duration::from_millis(50);
         let mut request_conn = None;
@@ -582,8 +582,18 @@ where
             }
             sleep(poll_interval).await;
         }
-        let request_conn = request_conn.unwrap();
-        let callback_conn = callback_conn.unwrap();
+        let request_conn = match request_conn {
+            Some(conn) => conn,
+            None => {
+                return Err(io::Error::new(io::ErrorKind::Other, "Failed to connect to child request socket"));
+            }
+        };
+        let callback_conn = match callback_conn {
+            Some(conn) => conn,
+            None => {
+                return Err(io::Error::new(io::ErrorKind::Other, "Failed to connect to child callback socket"));
+            }
+        };
 
         let actor = SubprocessActor::new(Box::new(request_conn), child, request_socket_path);
         let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), handler);
@@ -657,8 +667,13 @@ where
                         "Responding to handshake"
                     );
                     let resp = Control::<()>::Handshake;
-                    let resp_bytes = bincode::encode_to_vec(&resp, bincode::config::standard())
-                        .expect("Failed to encode handshake response");
+                    let resp_bytes = match bincode::encode_to_vec(&resp, bincode::config::standard()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            error!(event = "handshake", error = ?e, "Failed to encode handshake response");
+                            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to encode handshake response: {e}")));
+                        }
+                    };
                     conn.write_all(&resp_bytes).await?;
                     continue;
                 }
@@ -668,11 +683,11 @@ where
 
         let parent_cx =
             global::get_text_map_propagator(|propagator| propagator.extract(&trace_context.0));
-        let span = tracing::info_span!("child_message_handler");
+        let span = tracing::info_span!("child_message_handler", event = "message", handler = "child");
         span.set_parent(parent_cx);
 
         let reply_fut = async {
-            debug!(event = "message", status = "handling", "Handling message");
+            debug!(event = "message", status = "handling", handler = "child");
             actor_ref.ask(msg).await
         };
 
@@ -689,17 +704,21 @@ where
                 _ => SubprocessActorError::Protocol(format!("Non-serializable error: {e}")),
             }
         });
-        let reply_bytes =
-            bincode::encode_to_vec(&Control::Real(reply_to_send, TracingContext::default()), bincode::config::standard())
-                .expect("Failed to encode reply");
+        let reply_bytes = match bincode::encode_to_vec(&Control::Real(reply_to_send, TracingContext::default()), bincode::config::standard()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(event = "message", error = ?e, handler = "child", message = "Failed to encode reply");
+                break;
+            }
+        };
         if let Err(e) = conn.write_all(&reply_bytes).await {
-            error!(event = "message", error = ?e, "Failed to send reply to parent");
+            error!(event = "message", error = ?e, handler = "child", message = "Failed to send reply to parent");
             break;
         }
         debug!(
             event = "message",
             status = "complete",
-            "Message handled successfully"
+            handler = "child"
         );
     }
 
