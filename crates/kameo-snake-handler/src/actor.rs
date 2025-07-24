@@ -17,25 +17,128 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::pin::Pin;
 use std::future::Future;
 
-/// Configuration for Python subprocess
+
+/// Configuration for Python subprocess execution.
+/// 
+/// This struct defines all the configuration options needed to spawn and configure
+/// a Python subprocess that can handle both synchronous and streaming messages.
+/// 
+/// ## Configuration Options
+/// 
+/// - **Python Environment**: Paths, environment variables, and module configuration
+/// - **Function Specification**: Module name, function name, and file path
+/// - **Async Support**: Whether the Python function is async or sync
+/// - **Process Management**: Automatic environment setup and path management
+/// 
+/// ## Usage Example
+/// 
+/// ```rust
+/// let config = PythonConfig {
+///     python_path: vec![
+///         "/usr/bin/python3".to_string(),
+///         "/opt/homebrew/bin/python3".to_string(),
+///     ],
+///     module_name: "my_module".to_string(),
+///     function_name: "process_data".to_string(),
+///     env_vars: vec![
+///         ("PYTHONPATH".to_string(), "/path/to/modules".to_string()),
+///         ("DEBUG".to_string(), "1".to_string()),
+///     ],
+///     is_async: true,  // For async generators
+///     module_path: "python/my_module.py".to_string(),
+/// };
+/// ```
+/// 
+/// ## Python Function Requirements
+/// 
+/// ### Sync Functions
+/// ```python
+/// def process_data(message: dict) -> dict:
+///     return {"result": "processed", "data": message["input"]}
+/// ```
+/// 
+/// ### Async Generators (Streaming)
+/// ```python
+/// async def process_data(message: dict) -> AsyncGenerator[dict, None]:
+///     for i in range(5):
+///         yield {"index": i, "data": message["input"]}
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct PythonConfig {
+    /// List of Python executable paths to try (in order)
     pub python_path: Vec<String>,
+    /// Name of the Python module to import
     pub module_name: String,
+    /// Name of the function to call within the module
     pub function_name: String,
+    /// Environment variables to set in the Python subprocess
     pub env_vars: Vec<(String, String)>,
+    /// Whether the Python function is async (for streaming support)
     pub is_async: bool,
+    /// Path to the Python module file (for error reporting)
     pub module_path: String,
 }
 
-/// Python subprocess actor
-#[derive(Debug)]
+/// Kameo actor for Python subprocess communication with unified streaming support.
+/// 
+/// This actor manages communication with Python subprocesses, handling both synchronous
+/// and streaming message patterns. It integrates with the unified streaming protocol
+/// and provides seamless Python function execution.
+/// 
+/// ## Actor Features
+/// 
+/// - **Python Integration**: Direct execution of Python functions with PyO3
+/// - **Streaming Support**: Native support for Python async generators
+/// - **Type Conversion**: Automatic serialization between Rust and Python types
+/// - **Error Handling**: Python exceptions converted to Rust errors
+/// - **Concurrency Control**: Tracks concurrent task execution
+/// 
+/// ## Message Handling
+/// 
+/// - **Sync Messages**: Calls Python functions that return single values
+/// - **Stream Messages**: Calls Python async generators that yield multiple values
+/// - **Error Propagation**: Python exceptions properly converted and propagated
+/// - **Type Safety**: Full type safety through the message system
+/// 
+/// ## Usage
+/// 
+/// ```rust
+/// // Create actor with Python configuration
+/// let actor = PythonActor::new(config, py_function);
+/// 
+/// // Send sync message
+/// let response = actor.ask(MyMessage { data: "hello" }).await?;
+/// 
+/// // Send streaming message
+/// let stream = actor.send_stream(MyMessage { data: "stream" }).await?;
+/// while let Some(item) = stream.next().await {
+///     println!("Python response: {:?}", item?);
+/// }
+/// ```
+/// 
+/// ## Python Side
+/// 
+/// The actor calls Python functions with the following signatures:
+/// 
+/// ```python
+/// # Sync function
+/// def my_function(message: dict) -> dict:
+///     return {"result": "processed"}
+/// 
+/// # Async generator (streaming)
+/// async def my_function(message: dict) -> AsyncGenerator[dict, None]:
+///     for i in range(5):
+///         yield {"index": i, "data": message["data"]}
+/// ```
 pub struct PythonActor<M, E>
 where
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
+    /// Handler for Python function execution
     handler: PythonMessageHandler,
+    /// Counter for tracking concurrent task execution
     concurrent_tasks: Arc<AtomicUsize>,
+    /// Phantom data for message and callback types
     _phantom: std::marker::PhantomData<(M, E)>,
 }
 
